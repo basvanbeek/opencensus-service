@@ -31,6 +31,7 @@ import (
 	"go.opencensus.io/trace"
 
 	zipkinmodel "github.com/openzipkin/zipkin-go/model"
+	zipkinproto "github.com/openzipkin/zipkin-go/proto/v2"
 
 	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
 	agenttracepb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/trace/v1"
@@ -59,9 +60,22 @@ func (zi *ZipkinInterceptor) StartTraceInterception(ctx context.Context, spanSin
 	return nil
 }
 
-func (zi *ZipkinInterceptor) parseAndConvertToTraceSpans(jsonBlob []byte) (reqs []*agenttracepb.ExportTraceServiceRequest, err error) {
+func (zi *ZipkinInterceptor) parseAndConvertToTraceSpans(blob []byte, hdr http.Header) (reqs []*agenttracepb.ExportTraceServiceRequest, err error) {
 	var zipkinSpans []*zipkinmodel.SpanModel
-	if err = json.Unmarshal(jsonBlob, &zipkinSpans); err != nil {
+
+	debugWasSet := hdr.Get("X-B3-Flags") == "1"
+
+	// Zipkin can send protobuf via http
+	switch hdr.Get("Content-Type") {
+	// TODO: (@odeke-em) record the unique types of Content-Type uploads
+	case "application/x-protobuf":
+		zipkinSpans, err = zipkinproto.ParseSpans(blob, debugWasSet)
+
+	default: // By default, we'll assume using JSON
+		zipkinSpans, err = zi.deserializeFromJSON(blob, debugWasSet)
+	}
+
+	if err != nil {
 		return nil, err
 	}
 
@@ -98,6 +112,13 @@ func (zi *ZipkinInterceptor) parseAndConvertToTraceSpans(jsonBlob []byte) (reqs 
 	}
 
 	return reqs, nil
+}
+
+func (zi *ZipkinInterceptor) deserializeFromJSON(jsonBlob []byte, debugWasSet bool) (zs []*zipkinmodel.SpanModel, err error) {
+	if err = json.Unmarshal(jsonBlob, &zs); err != nil {
+		return nil, err
+	}
+	return zs, nil
 }
 
 // StopTraceInterception tells the interceptor that should stop interception,
@@ -159,7 +180,7 @@ func (zi *ZipkinInterceptor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = c.Close()
 	}
 	_ = r.Body.Close()
-	ereqs, err := zi.parseAndConvertToTraceSpans(slurp)
+	ereqs, err := zi.parseAndConvertToTraceSpans(slurp, r.Header)
 	if err != nil {
 		span.SetStatus(trace.Status{
 			Code:    trace.StatusCodeInvalidArgument,
